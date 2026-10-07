@@ -1725,6 +1725,9 @@ public static partial class Gen5ShaderTranslator
             0x0A => "SBufferLoadDwordx4",
             0x0B => "SBufferLoadDwordx8",
             0x0C => "SBufferLoadDwordx16",
+            // Shader clocks: a 64-bit counter in an SGPR pair, no memory access.
+            0x24 => "SMemtime",
+            0x25 => "SMemrealtime",
             _ => string.Empty,
         };
 
@@ -2228,6 +2231,15 @@ public static partial class Gen5ShaderTranslator
                     count,
                     immediateOffsetBytes,
                     dynamicOffsetRegister);
+                break;
+            }
+            case Gen5ShaderEncoding.Smem when opcode is "SMemtime" or "SMemrealtime":
+            {
+                // Without a memory control the scalar graph treats the pair as an unknown value.
+                var clockDestination = (word >> 6) & 0x7F;
+                sources = [];
+                destinations = [Gen5Operand.Scalar(clockDestination), Gen5Operand.Scalar(clockDestination + 1)];
+                control = null;
                 break;
             }
             case Gen5ShaderEncoding.Smem:

@@ -2219,6 +2219,12 @@ public static partial class Gen5SpirvTranslator
                 return TryEmitScalarAlu(instruction, out error);
             }
 
+            if (instruction.Opcode is "SMemtime" or "SMemrealtime" && _shaderClock != 0)
+            {
+                EmitShaderClock(instruction);
+                return true;
+            }
+
             if (instruction.Encoding is
                 Gen5ShaderEncoding.Sopp or
                 Gen5ShaderEncoding.Smrd or
@@ -2228,6 +2234,18 @@ public static partial class Gen5SpirvTranslator
             }
 
             return TryEmitVectorAlu(instruction, out error);
+        }
+
+        // s_memtime/s_memrealtime: the host exposes no GPU clock to the shader, so each read
+        // advances a per-invocation counter. Successive reads keep increasing, which is what
+        // titles rely on for elapsed-time deltas and timeouts; absolute values carry no meaning.
+        private void EmitShaderClock(Gen5ShaderInstruction instruction)
+        {
+            const uint ShaderClockStep = 0x400;
+            var next = IAdd(Load(_uintType, _shaderClock), UInt(ShaderClockStep));
+            Store(_shaderClock, next);
+            StoreS(instruction.Destinations[0].Value, next);
+            StoreS(instruction.Destinations[1].Value, UInt(0));
         }
 
         private bool TryEmitDataShare(

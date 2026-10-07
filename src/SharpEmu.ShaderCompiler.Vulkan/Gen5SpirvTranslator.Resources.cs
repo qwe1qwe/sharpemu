@@ -66,6 +66,7 @@ public static partial class Gen5SpirvTranslator
         private readonly ShaderCompileRequest _request;
         private readonly Dictionary<DescriptorBindingKind, LayoutImageClass> _imageClasses = [];
         private readonly Dictionary<int, uint> _indirectKeyScratch = [];
+        private uint _shaderClock;
         private uint _pushData;
         private uint _shaderData;
         private uint _flattenedTable;
@@ -221,6 +222,13 @@ public static partial class Gen5SpirvTranslator
                     _module.AddName(_deviceBufferWordScratch, "deviceBufferWord");
                     _interfaces.Add(_deviceBufferWordScratch);
                 }
+            }
+
+            if (request.Program.Instructions.Any(instruction => instruction.Opcode is "SMemtime" or "SMemrealtime"))
+            {
+                _shaderClock = _module.AddGlobalVariable(_privateUintPointer, SpirvStorageClass.Private, UInt(0));
+                _module.AddName(_shaderClock, "shaderClock");
+                _interfaces.Add(_shaderClock);
             }
 
             foreach (var memoryIndex in request.IndirectKeyMemoryIndices)
