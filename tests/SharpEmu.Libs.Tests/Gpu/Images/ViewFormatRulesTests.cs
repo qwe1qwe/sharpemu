@@ -72,12 +72,15 @@ public sealed class ViewFormatRulesTests
     }
 
     [Fact]
-    public void DepthViews_AcceptOnlyTheReplicatedSwizzles()
+    public void DepthViews_AcceptOnlySwizzlesOfTheDepthChannel()
     {
         var replicated = ViewFormatRules.PackDestinationSelect(4, 4, 4, 4);
         Assert.True(ViewFormatRules.IsSupportedSampledDepthView(Format.D32Sfloat, Format.R32Sfloat, replicated));
         Assert.True(ViewFormatRules.IsSupportedSampledDepthView(Format.D16Unorm, Format.R16Unorm, ViewFormatRules.PackDestinationSelect(4, 0, 0, 1)));
         Assert.False(ViewFormatRules.IsSupportedSampledDepthView(Format.D32Sfloat, Format.R32Sfloat, ViewFormatRules.PackDestinationSelect(4, 5, 6, 7)));
+        Assert.True(ViewFormatRules.IsSupportedSampledDepthView(Format.D16Unorm, Format.R16Unorm, ViewFormatRules.PackDestinationSelect(4, 4, 4, 1)));
+        Assert.True(ViewFormatRules.IsSupportedSampledDepthView(Format.D32Sfloat, Format.R32Sfloat, ViewFormatRules.PackDestinationSelect(4, 4, 0, 1)));
+        Assert.False(ViewFormatRules.IsSupportedSampledDepthView(Format.D32Sfloat, Format.R32Sfloat, ViewFormatRules.PackDestinationSelect(4, 4, 4, 7)));
         Assert.False(ViewFormatRules.IsSupportedSampledDepthView(Format.R32Sfloat, Format.R32Sfloat, replicated));
         Assert.Equal(replicated, ViewFormatRules.SelectSampledDepthView(Format.D32SfloatS8Uint, Format.R32Uint, replicated));
         Assert.True(ViewFormatRules.IsDepthCompatible(Format.R16Unorm));

@@ -280,9 +280,11 @@ public static class ViewFormatRules
             ? swizzle
             : throw UnsupportedColorView("sampled", imageFormat, viewFormat, swizzle);
 
+    // A depth view has a single channel: every destination may read it (R) or a
+    // constant, but G/B/A have no depth meaning. Marvel's Wolverine samples D16 as RRR1.
     public static bool IsSupportedSampledDepthView(Format imageFormat, Format viewFormat, uint swizzle) =>
-        IsSupportedSampledDepthFormat(imageFormat, viewFormat) &&
-        (swizzle == PackDestinationSelect(4, 4, 4, 4) || swizzle == PackDestinationSelect(4, 0, 0, 0) || swizzle == PackDestinationSelect(4, 0, 0, 1));
+        IsSupportedSampledDepthFormat(imageFormat, viewFormat) && IsValidSwizzle(swizzle) &&
+        Enumerable.Range(0, 4).All(channel => DestinationSelect(swizzle, (uint)channel) is 0 or 1 or 4);
 
     public static uint SelectSampledDepthView(Format imageFormat, Format viewFormat, uint swizzle) =>
         IsSupportedSampledDepthView(imageFormat, viewFormat, swizzle)
