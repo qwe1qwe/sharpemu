@@ -197,6 +197,25 @@ public static class ResourceMaterializer
                     }
                     continue;
                 }
+                if (indirect.LaneKeys is { } laneKeys)
+                {
+                    var laneSourceIndices = new uint[1 + laneKeys.Sources.Count];
+                    laneSourceIndices[0] = indirect.HeapSource;
+                    for (var sourceIndex = 0; sourceIndex < laneKeys.Sources.Count; sourceIndex++)
+                        laneSourceIndices[1 + sourceIndex] = laneKeys.Sources[sourceIndex].BufferSource;
+                    if (!RuntimeValueEvaluator.EvaluateSources(plan, laneSourceIndices, cleanInputs, [], evaluateTable: false,
+                        out var laneSources, out _))
+                        return false;
+                    if (!MaterializeLaneKeyedImage(laneKeys, laneSources, image.R128, inputs, out var laneTable, out failure))
+                        return false;
+                    snapshot.Images[imageIndex] = laneTable.Descriptors[(int)laneTable.Candidates[0]].Dwords;
+                    if (laneTable.Descriptors.Count > 1)
+                    {
+                        laneTable.Resource = (uint)imageIndex;
+                        snapshot.IndirectImages.Add(laneTable);
+                    }
+                    continue;
+                }
                 if (indirect.Dense)
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
@@ -779,6 +798,267 @@ public static class ResourceMaterializer
         }
 
         return FinishIndirectImage(probed, offsets, out result, out failure);
+    }
+
+    // Enumerates every record a waterfall key can be loaded from, masks the loaded
+    // value like the guest does and reads the heap descriptor each distinct key selects.
+    // Records out of range read zero on the hardware, so key zero is always possible.
+    private static bool MaterializeLaneKeyedImage(
+        LaneKeyedImageSelector laneKeys,
+        IReadOnlyList<DescriptorWords> sources,
+        bool r128,
+        ResourceRuntimeInputs inputs,
+        out IndirectImageTable result,
+        out ResourceMaterializationFailure failure)
+    {
+        failure = ResourceMaterializationFailure.Other;
+        result = new IndirectImageTable();
+        if (sources.Count != laneKeys.Sources.Count + 1 || sources[0].DwordCount != 4 || inputs.ReadCleanMemory is null)
+            return false;
+
+        var keys = new SortedSet<uint> { 0 };
+        foreach (var constant in laneKeys.Constants)
+            keys.Add(constant);
+
+        var budget = MaxLaneKeyRecordReads;
+        for (var index = 0; index < laneKeys.Sources.Count; index++)
+        {
+            var source = sources[index + 1];
+            string reason;
+            if (source.DwordCount != 4)
+                reason = "descriptor width";
+            else if (CollectLaneKeys(laneKeys.Sources[index], source.Dwords, inputs, keys, ref budget, out reason))
+                continue;
+
+            ReportLaneKeyFailure(laneKeys.Sources[index], source.Dwords, reason);
+            failure = ResourceMaterializationFailure.UnresolvedImageKeys;
+            return false;
+        }
+
+        if ((ulong)keys.Count > MaxIndirectImageProbes)
+        {
+            ReportLaneKeyFailure(laneKeys.Sources[0], sources[1].Dwords, $"{keys.Count} distinct keys");
+            failure = ResourceMaterializationFailure.UnresolvedImageKeys;
+            return false;
+        }
+
+        var heap = sources[0].Dwords;
+        var probed = new List<uint[]>(keys.Count);
+        var offsets = new List<uint>(keys.Count);
+        foreach (var key in keys)
+        {
+            var candidate = new uint[8];
+            var entry = unchecked(laneKeys.TableOffset + (key << (int)LaneKeyShift));
+            for (uint dword = 0; dword < candidate.Length; dword++)
+            {
+                if (!ReadScalarBufferWord(heap, entry, dword * sizeof(uint), inputs, out candidate[dword]))
+                    return false;
+            }
+
+            if (!UsableImageCandidate(candidate, r128))
+                Array.Clear(candidate);
+            probed.Add(candidate);
+            offsets.Add(unchecked(laneKeys.DynamicOffsetBase + (key << (int)LaneKeyShift)));
+        }
+
+        if (!FinishIndirectImage(probed, offsets, out result, out failure))
+        {
+            ReportLaneKeyFailure(laneKeys.Sources[0], sources[1].Dwords,
+                $"{keys.Count} keys select more than {ShaderResourceInfo.MaxImages} distinct descriptors");
+            return false;
+        }
+
+        return true;
+    }
+
+    private static readonly HashSet<string> _reportedLaneKeyFailures = [];
+
+    // Once per distinct cause: the access is skipped on every dispatch, the log should say why once.
+    private static void ReportLaneKeyFailure(LaneKeySource source, ReadOnlySpan<uint> descriptor, string reason)
+    {
+        var words = descriptor.Length >= 4
+            ? $"base=0x{(descriptor[0] | ((ulong)(descriptor[1] & 0xFFFF) << 32)):X} stride={(descriptor[1] >> 16) & 0x3FFF} records={descriptor[2]} word3=0x{descriptor[3]:X8}"
+            : $"dwords={descriptor.Length}";
+        var message = $"lane-keyed image keys unresolved: {reason}; key source offset={source.OffsetBytes} component={source.Component} " +
+            $"formatted={source.Formatted} indexed={source.Indexed} mask=0x{source.Mask:X} {words}";
+        lock (_reportedLaneKeyFailures)
+        {
+            if (_reportedLaneKeyFailures.Count >= 64 || !_reportedLaneKeyFailures.Add(reason + "|" + words))
+                return;
+        }
+
+        Console.Error.WriteLine($"[GPU][WARN] {message}");
+    }
+
+    private const uint LaneKeyShift = 5;
+
+    // Upper bound on key-buffer words one materialization reads; a larger table
+    // rejects the access instead of stalling every draw that uses it.
+    private const uint MaxLaneKeyRecordReads = 1u << 18;
+
+    private static bool CollectLaneKeys(
+        LaneKeySource source,
+        ReadOnlySpan<uint> descriptor,
+        ResourceRuntimeInputs inputs,
+        SortedSet<uint> keys,
+        ref uint budget,
+        out string reason)
+    {
+        reason = string.Empty;
+        var baseAddress = (descriptor[0] | ((ulong)(descriptor[1] & 0xFFFF) << 32)) & AddressMask;
+        var stride = (descriptor[1] >> 16) & 0x3FFF;
+        var swizzled = (descriptor[1] >> 31) != 0;
+        var records = descriptor[2];
+        if (swizzled)
+        {
+            reason = "swizzled key buffer";
+            return false;
+        }
+
+        // A null or empty buffer only ever reads zero, which is already a key.
+        if (baseAddress == 0 || records == 0)
+            return true;
+
+        if (!TryGetLaneKeyLayout(source, descriptor[3], out var byteOffset, out var bitOffset, out var bitCount, out var signed,
+                out var constantValue))
+        {
+            reason = "unsupported key format";
+            return false;
+        }
+
+        if (constantValue is { } selected)
+        {
+            keys.Add(selected & source.Mask);
+            return true;
+        }
+
+        // An indexed load addresses whole records and every record below num_records is
+        // in range. Without an index (offen is excluded by the planner) every lane reads
+        // the same element, and past the buffer size it reads zero, already a key.
+        var componentBytes = (ulong)source.OffsetBytes + byteOffset;
+        ulong elementCount;
+        ulong elementStride;
+        if (source.Indexed && stride != 0)
+        {
+            elementCount = records;
+            elementStride = stride;
+        }
+        else
+        {
+            var size = stride != 0 ? (ulong)stride * records : records;
+            if (componentBytes + (bitOffset + bitCount + 7) / 8 > size)
+                return true;
+            elementCount = 1;
+            elementStride = 0;
+        }
+
+        for (ulong element = 0; element < elementCount; element++)
+        {
+            if (budget == 0)
+            {
+                reason = $"more than {MaxLaneKeyRecordReads} key records";
+                return false;
+            }
+            budget--;
+
+            var byteAddress = element * elementStride + componentBytes;
+            var aligned = byteAddress & ~3ul;
+            if (!TryReadLaneKeyWord(baseAddress, aligned, inputs, out var word))
+                continue;
+
+            var shift = (int)((byteAddress - aligned) * 8 + bitOffset);
+            var value = bitCount >= 32 ? word : (word >> shift) & ((1u << (int)bitCount) - 1);
+            if (signed && bitCount < 32 && (value & (1u << (int)(bitCount - 1))) != 0)
+                value |= ~((1u << (int)bitCount) - 1);
+            keys.Add(value & source.Mask);
+        }
+
+        return true;
+    }
+
+    // A whole-dword load reads its component straight from memory. A formatted load
+    // goes through the format and destination swizzle of its descriptor (or of the
+    // instruction for a typed load); only components that keep the stored integer
+    // bits can be keys.
+    private static bool TryGetLaneKeyLayout(
+        LaneKeySource source,
+        uint descriptorWord3,
+        out uint byteOffset,
+        out uint bitOffset,
+        out uint bitCount,
+        out bool signed,
+        out uint? constantValue)
+    {
+        byteOffset = 0;
+        bitOffset = 0;
+        bitCount = 32;
+        signed = false;
+        constantValue = null;
+        if (!source.Formatted)
+        {
+            byteOffset = source.Component * sizeof(uint);
+            return true;
+        }
+
+        var unifiedFormat = source.TypedFormat != 0 ? source.TypedFormat : (descriptorWord3 >> 12) & 0x7F;
+        if (!Gfx10UnifiedFormat.TryDecode(unifiedFormat, out var dataFormat, out var numberFormat) || dataFormat == 0)
+            return false;
+
+        var select = (descriptorWord3 >> (int)(source.Component * 3)) & 0x7;
+        switch (select)
+        {
+            case 0:
+                constantValue = 0;
+                return true;
+            case 1:
+                // One in an integer format; a float format's 1.0 is not a valid key either way.
+                if (numberFormat is not (NumberFormatUint or NumberFormatSint))
+                    return false;
+                constantValue = 1;
+                return true;
+            case < 4:
+                return false;
+        }
+
+        if (!Gfx10UnifiedFormat.TryGetComponentLayout(dataFormat, select - 4, out byteOffset, out bitOffset, out bitCount))
+        {
+            // A channel the format lacks reads zero (alpha reads one, never a valid key).
+            if (select - 4 < 3)
+            {
+                constantValue = 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (bitCount == 32 && bitOffset == 0)
+            return true;
+        if (numberFormat == NumberFormatUint)
+            return bitCount is > 0 and < 32;
+        if (numberFormat == NumberFormatSint)
+        {
+            signed = true;
+            return bitCount is > 0 and < 32;
+        }
+
+        return false;
+    }
+
+    private const uint NumberFormatUint = 4;
+    private const uint NumberFormatSint = 5;
+
+    // Key tables are ordinarily written by the CPU. A table the GPU still owns is read
+    // through the synchronizing reader instead; a key that cannot be read at all only
+    // costs that record its descriptor, which the shader then sees as the null candidate.
+    private static bool TryReadLaneKeyWord(ulong baseAddress, ulong offset, ResourceRuntimeInputs inputs, out uint word)
+    {
+        word = 0;
+        if (offset > AddressMask || baseAddress > AddressMask - offset)
+            return false;
+        var address = baseAddress + offset;
+        return (inputs.ReadCleanMemory is not null && inputs.ReadCleanMemory(address, out word)) ||
+            (inputs.ReadMemory is not null && inputs.ReadMemory(address, out word));
     }
 
     private static bool TryReadCleanWord(ulong baseAddress, ulong offset, ResourceRuntimeInputs inputs, out uint word)

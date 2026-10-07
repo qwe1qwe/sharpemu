@@ -9,4 +9,7 @@ public enum ResourceMaterializationFailure
     Other,
     IncompatibleImageCandidates,
     ImageCapacityExceeded,
+    // A per-lane descriptor key comes from a table too large or in a layout the host
+    // cannot enumerate; the access is rejected like an over-capacity one.
+    UnresolvedImageKeys,
 }

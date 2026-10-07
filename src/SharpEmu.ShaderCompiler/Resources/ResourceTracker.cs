@@ -1160,7 +1160,8 @@ public sealed partial class ResourceTracker
 
             if (TryMakeIndirectImage(handle, memory.Pc, out var plan) ||
                 TryMakeDenseIndirectImage(handle, memory.Pc, out plan) ||
-                TryMakeDirectImage(handle, out plan))
+                TryMakeDirectImage(handle, out plan) ||
+                TryMakeLaneKeyedImage(handle, memory.Pc, out plan))
             {
                 _indirectImages.Add(plan);
             }

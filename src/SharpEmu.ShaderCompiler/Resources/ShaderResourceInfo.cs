@@ -207,9 +207,32 @@ public sealed record IndirectImageSelector(
     public uint DynamicOffsetBase { get; init; }
     public uint KeyBound { get; init; }
     public WaveIndexedImageSelector? WaveIndexed { get; init; }
+    public LaneKeyedImageSelector? LaneKeys { get; init; }
 
     // The key read's immediate offset. The hardware adds it after the 32-bit selector offset, without wrapping.
     public uint MaterialImmediate { get; init; }
+}
+
+// A per-lane descriptor key read from guest buffers. The guest walks a waterfall loop
+// (v_readfirstlane, v_cmp_eq, s_and_saveexec) so every distinct lane key is made
+// uniform once and selects a heap record. The key itself is lane data, so the host
+// enumerates every record of the buffers it can come from instead of proving one value.
+public sealed record LaneKeySource(uint BufferSource, uint OffsetBytes, uint Component, bool Formatted, bool Indexed, uint Mask, uint TypedFormat);
+
+public sealed record LaneKeyedImageSelector(uint TableOffset, uint DynamicOffsetBase)
+{
+    public IReadOnlyList<LaneKeySource> Sources { get; init; } = [];
+
+    // Masked keys the guest can select without reading memory (v_mov or v_cndmask constants).
+    public IReadOnlyList<uint> Constants { get; init; } = [];
+
+    // Sources and constants are kept sorted, so equal selectors compare equal and
+    // equivalent waterfall loops share one root image.
+    public bool Equals(LaneKeyedImageSelector? other) =>
+        other is not null && TableOffset == other.TableOffset && DynamicOffsetBase == other.DynamicOffsetBase &&
+        Sources.SequenceEqual(other.Sources) && Constants.SequenceEqual(other.Constants);
+
+    public override int GetHashCode() => HashCode.Combine(TableOffset, DynamicOffsetBase, Sources.Count, Constants.Count);
 }
 
 public sealed record DirectImageCandidate(uint Offset, uint Source);
