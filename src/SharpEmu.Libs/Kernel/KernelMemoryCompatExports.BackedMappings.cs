@@ -89,6 +89,7 @@ public static partial class KernelMemoryCompatExports
             _directAllocations.Reset();
             _flexibleBacking.Reset();
             _nextVirtualAddress = 0;
+            ResetAmmStateLocked();
             _backingOwner = null;
         }
     }
