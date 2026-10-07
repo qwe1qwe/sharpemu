@@ -11,6 +11,7 @@ namespace SharpEmu.Libs.Kernel;
 internal static class KernelPthreadState
 {
     private const int ThreadObjectSize = 0x1000;
+    internal const int ThreadObjectTidOffset = 0x0;
 
     private static readonly ConcurrentDictionary<ulong, ThreadIdentity> Threads = new();
     private static readonly byte[] ZeroThreadObject = new byte[ThreadObjectSize];
@@ -129,6 +130,12 @@ internal static class KernelPthreadState
     {
         var pointer = Marshal.AllocHGlobal(ThreadObjectSize);
         Marshal.Copy(ZeroThreadObject, 0, pointer, ThreadObjectSize);
+
+        // The object mirrors libthr's struct pthread, whose first member is the
+        // kernel thread id. Titles read it straight from the handle after
+        // scePthreadCreate and treat 0 as a failed start (Marvel's Wolverine
+        // tears its renderer down when the render thread id reads back as 0).
+        Marshal.WriteInt64(pointer, ThreadObjectTidOffset, unchecked((long)uniqueId));
 
         var handle = unchecked((ulong)pointer.ToInt64());
         Threads[handle] = new ThreadIdentity(uniqueId, string.IsNullOrWhiteSpace(name) ? $"Thread-{uniqueId:X}" : name);
