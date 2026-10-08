@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Text;
 using SharpEmu.HLE;
 
@@ -232,6 +233,113 @@ public static class NpEntitlementAccessExports
             string.Equals(label, entitlement.Label, StringComparison.Ordinal))
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : NpEntitlementAccessErrorNoEntitlement);
+    }
+
+    // Unified entitlements (PSN-side store purchases) are queried asynchronously:
+    // Request creates a request id, Poll reports the result and Delete releases it.
+    // Offline there is nothing to fetch, so every request completes at once with no
+    // entries and no further page (next/previous offset -1). Marvel's Wolverine
+    // (PPSA03671) runs this query from EntitlementSysPPR::QueryThread.
+    private const int NpEntitlementAccessPollFinished = 0;
+    private const int NoFurtherPage = -1;
+    private static readonly ConcurrentDictionary<long, byte> PendingRequests = new();
+    private static long _nextRequestId;
+
+    [SysAbiExport(
+        Nid = "uCZf2L27th8",
+        ExportName = "sceNpEntitlementAccessRequestUnifiedEntitlementInfoList",
+        Target = Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessRequestUnifiedEntitlementInfoList(CpuContext ctx)
+    {
+        var requestIdAddress = ctx[CpuRegister.R9];
+        if (requestIdAddress == 0)
+        {
+            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
+        }
+
+        var requestId = Interlocked.Increment(ref _nextRequestId);
+        Span<byte> requestIdBytes = stackalloc byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64LittleEndian(requestIdBytes, requestId);
+        if (!ctx.Memory.TryWrite(requestIdAddress, requestIdBytes))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        PendingRequests[requestId] = 0;
+        TraceNpEntitlementAccess(
+            $"request_unified_info_list user=0x{(uint)ctx[CpuRegister.Rdi]:X8} service={(uint)ctx[CpuRegister.Rsi]} " +
+            $"param=0x{ctx[CpuRegister.R8]:X16} -> request={requestId}");
+        return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    [SysAbiExport(
+        Nid = "nAEqawEZG5s",
+        ExportName = "sceNpEntitlementAccessPollUnifiedEntitlementInfoList",
+        Target = Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessPollUnifiedEntitlementInfoList(CpuContext ctx)
+    {
+        var requestId = unchecked((long)ctx[CpuRegister.Rdi]);
+        var resultAddress = ctx[CpuRegister.Rsi];
+        var hitNumAddress = ctx[CpuRegister.R8];
+        var nextOffsetAddress = ctx[CpuRegister.R9];
+        if (!PendingRequests.ContainsKey(requestId) || resultAddress == 0)
+        {
+            return ctx.SetReturn(NpEntitlementAccessErrorParameter);
+        }
+
+        if (!ctx.TryGetImportStackArgument(0, out var previousOffsetAddress) &&
+            !ctx.TryReadUInt64(ctx[CpuRegister.Rsp] + sizeof(ulong), out previousOffsetAddress))
+        {
+            previousOffsetAddress = 0;
+        }
+
+        if (!TryWriteInt32(ctx, resultAddress, 0) ||
+            (hitNumAddress != 0 && !TryWriteInt32(ctx, hitNumAddress, 0)) ||
+            (nextOffsetAddress != 0 && !TryWriteInt32(ctx, nextOffsetAddress, NoFurtherPage)) ||
+            (previousOffsetAddress != 0 && !TryWriteInt32(ctx, previousOffsetAddress, NoFurtherPage)))
+        {
+            return ctx.SetReturn(OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        TraceNpEntitlementAccess($"poll_unified_info_list request={requestId} -> finished hit_num=0");
+        return ctx.SetReturn(NpEntitlementAccessPollFinished);
+    }
+
+    [SysAbiExport(
+        Nid = "HFcQl9TMcFQ",
+        ExportName = "sceNpEntitlementAccessAbortRequest",
+        Target = Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessAbortRequest(CpuContext ctx)
+    {
+        var requestId = unchecked((long)ctx[CpuRegister.Rdi]);
+        TraceNpEntitlementAccess($"abort_request request={requestId}");
+        return ctx.SetReturn(PendingRequests.ContainsKey(requestId)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : NpEntitlementAccessErrorParameter);
+    }
+
+    [SysAbiExport(
+        Nid = "Z0eQj8m7XA8",
+        ExportName = "sceNpEntitlementAccessDeleteRequest",
+        Target = Generation.Gen5,
+        LibraryName = "libSceNpEntitlementAccess")]
+    public static int NpEntitlementAccessDeleteRequest(CpuContext ctx)
+    {
+        var requestId = unchecked((long)ctx[CpuRegister.Rdi]);
+        TraceNpEntitlementAccess($"delete_request request={requestId}");
+        return ctx.SetReturn(PendingRequests.TryRemove(requestId, out _)
+            ? (int)OrbisGen2Result.ORBIS_GEN2_OK
+            : NpEntitlementAccessErrorParameter);
+    }
+
+    private static bool TryWriteInt32(CpuContext ctx, ulong address, int value)
+    {
+        Span<byte> bytes = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+        return ctx.Memory.TryWrite(address, bytes);
     }
 
     private static bool TryWriteAddcontEntitlementInfo(
