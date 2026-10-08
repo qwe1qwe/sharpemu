@@ -56,6 +56,33 @@ public sealed class LaneKeyedImageTests
         return Program([.. instructions]);
     }
 
+    // The heap record comes from a second table: the waterfall makes a lane index
+    // uniform, loads the record key from s[0:3] at that index and indexes the heap
+    // with it. Neither key can be enumerated, but the heap is finite.
+    private static Gen5ShaderProgram TwoLevelProgram()
+    {
+        var instructions = new List<Gen5ShaderInstruction>();
+        uint pc = 0x1000;
+        void Add(Func<uint, Gen5ShaderInstruction> make) { instructions.Add(make(pc)); pc += 8; }
+
+        Add(current => BufferAccess(current, "BufferLoadDword", 0, offset: 8, vectorData: 2, indexEnabled: true));
+        Add(current => Vop2(current, "VAddU32", 6, Operand(3), Gen5Operand.Vector(2)));
+        for (uint index = 0; index < 4; index++)
+        {
+            var register = 24 + index;
+            Add(current => MoveScalar(current, register, 0));
+        }
+
+        Add(current => ReadFirstLane(current, 8, 6));
+        Add(current => Sop2(current, "SLshlB32", 9, Gen5Operand.Scalar(8), Operand(2)));
+        Add(current => ScalarBufferLoad(current, 0, destination: 10, count: 1, dynamicOffsetRegister: 9));
+        Add(current => Sop2(current, "SLshlB32", 11, Gen5Operand.Scalar(10), Operand(5)));
+        Add(current => ScalarBufferLoad(current, 4, destination: 16, count: 8, dynamicOffsetRegister: 11));
+        Add(current => Image(current, "ImageSample", 16, 24));
+        Add(EndProgram);
+        return Program([.. instructions]);
+    }
+
     private static uint[] Descriptor(uint variant)
     {
         var descriptor = ResourceTrackerTests.ImageDescriptor();
@@ -163,7 +190,8 @@ public sealed class LaneKeyedImageTests
     }
 
     // Key arithmetic the host cannot enumerate still indexes a finite heap: the access is
-    // planned heap-indexed, without a key set, and skipped until a heap array is bound.
+    // planned heap-indexed, without a key set, and reads a null descriptor until a heap
+    // array is bound.
     [Fact]
     public void KeyArithmeticOutsideTheProvenShapesPlansTheWholeHeap()
     {
@@ -180,9 +208,22 @@ public sealed class LaneKeyedImageTests
         ResourceTrackerTests.WriteImage(memory, 0x2000, Descriptor(0));
         var snapshot = new ResourceSnapshot();
         var specialization = new ResourceSpecialization();
-        Assert.False(ResourceMaterializer.Materialize(plan, Inputs(KeyBufferUserData(16, 1), readCleanMemory: memory.Read),
-            ref snapshot, ref specialization, out var failure));
-        Assert.Equal(ResourceMaterializationFailure.UnresolvedImageKeys, failure);
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs(KeyBufferUserData(16, 1), readCleanMemory: memory.Read),
+            ref snapshot, ref specialization));
+        Assert.Equal(new uint[8], snapshot.Images[0]);
+    }
+
+    [Fact]
+    public void AKeyLoadedThroughASecondTableIndexesTheHeap()
+    {
+        var plan = Extract(TwoLevelProgram());
+        Assert.Single(plan.Info.Images);
+        var access = Assert.Single(plan.IndirectImages);
+        Assert.True(access.KeyIsAddressOffset);
+
+        var indirect = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.Null(indirect.LaneKeys);
+        Assert.Equal(new HeapIndexedImageSelector(0, 0, 5), indirect.HeapIndexed);
     }
 
     [Fact]

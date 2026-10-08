@@ -219,9 +219,10 @@ public static class ResourceMaterializer
                 if (indirect.HeapIndexed is not null)
                 {
                     // Without a proven key set the access needs the whole heap bound as one
-                    // image array; until the backend binds it, the access is skipped.
-                    failure = ResourceMaterializationFailure.UnresolvedImageKeys;
-                    return false;
+                    // image array. Until the backend binds it, the access reads a null
+                    // descriptor, as an unresolvable dynamic descriptor did before.
+                    snapshot.Images[imageIndex] = new uint[8];
+                    continue;
                 }
                 if (indirect.Dense)
                 {

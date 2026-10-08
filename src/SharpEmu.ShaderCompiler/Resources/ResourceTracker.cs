@@ -473,7 +473,8 @@ public sealed partial class ResourceTracker
                     pc,
                     $"{memoryOpcode ?? "memory"} ({memoryAccess}) {expected} dword {badDword} is not a valid runtime value" +
                         DescribeUndefinedLeaves(source.Dwords[badDword]) +
-                        $" (value: {DescribeValueShape(source.Dwords[badDword])})");
+                        $" (value: {DescribeValueShape(source.Dwords[badDword])})" +
+                        DescribeHeapLookupRejection(handle));
             }
         }
 

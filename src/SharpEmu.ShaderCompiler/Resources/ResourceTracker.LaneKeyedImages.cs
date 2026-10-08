@@ -44,35 +44,35 @@ public sealed partial class ResourceTracker
             var read = handle.Operands[dword];
             var memory = ScalarReadMemory(read, out var memoryIndex);
             if (memory is null || memory.Kind != MemoryResourceKind.ScalarBuffer || !MemoryIndexBelongsTo(memoryIndex, read))
-                return false;
+                return RejectHeapLookup(handle, $"descriptor dword {dword} is not a scalar buffer read");
 
             var componentOffset = (uint)dword * sizeof(uint);
             if (memory.Offset < componentOffset)
-                return false;
+                return RejectHeapLookup(handle, $"descriptor dword {dword} is below its record");
             var immediate = memory.Offset - componentOffset;
             if (dword == 0)
                 tableImmediate = immediate;
             else if (immediate != tableImmediate)
-                return false;
+                return RejectHeapLookup(handle, "descriptor dwords use different record offsets");
 
             var currentHandle = read.Operands[0];
             if (currentHandle.Kind != ScalarValueKind.BufferHandle ||
                 (heapHandle is not null && !ReferenceEquals(currentHandle, heapHandle) && !_graph.Equivalent(currentHandle, heapHandle)))
-                return false;
+                return RejectHeapLookup(handle, "descriptor dwords come from different heaps");
             heapHandle = currentHandle;
 
             var offset = read.Operands[1];
             if (heapOffset is null)
                 heapOffset = offset;
             else if (!ReferenceEquals(offset, heapOffset) && !_graph.Equivalent(offset, heapOffset))
-                return false;
+                return RejectHeapLookup(handle, "descriptor dwords use different dynamic offsets");
 
             reads[dword] = read;
             memoryIndices[dword] = memoryIndex;
         }
 
         if (heapHandle is null || heapOffset is null)
-            return false;
+            return RejectHeapLookup(handle, "no heap");
 
         // The register offset may add a constant to the shifted key before the load.
         uint dynamicBase = 0;
@@ -91,41 +91,51 @@ public sealed partial class ResourceTracker
             }
             else
             {
-                return false;
+                return RejectHeapLookup(handle, "the record offset adds a non-constant");
             }
         }
 
         if (scaled.Kind != ScalarValueKind.Operation || scaled.Operation != ScalarOperation.ShiftLeft32 ||
             scaled.Operands.Length != 2 || !scaled.Operands[1].IsConstant ||
             scaled.Operands[1].ConstantU32 != LaneKeyedImageShift)
-            return false;
+            return RejectHeapLookup(handle, "the record offset is not key << 5");
 
+        // A key the host can evaluate selects one record; the ordinary descriptor path
+        // reads it. Only a key the GPU computes needs the heap.
         var key = scaled.Operands[0];
-        if (key.Kind != ScalarValueKind.FirstLane)
-            return false;
+        if (_plan.ValidateRuntimeValue(key) || reads.All(read => _plan.ValidateRuntimeValue(read)))
+            return RejectHeapLookup(handle, "the record key is host-evaluable");
 
+        // The key the shader computes indexes the heap directly. A v_readfirstlane key of
+        // whole-dword buffer loads can also be enumerated (the bounded fallback); any
+        // other key, e.g. one loaded through a second table, is the heap's alone.
         var instructions = _graph.Program.Instructions;
-        var firstLaneIndex = FindInstructionIndex(instructions, (uint)key.Payload);
-        if (firstLaneIndex < 0 ||
-            instructions[firstLaneIndex] is not { Opcode: "VReadfirstlaneB32", Sources.Count: 1 } firstLane ||
-            firstLane.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } laneKey)
-            return false;
-
         var leaves = new List<(Gen5ShaderInstruction Load, uint Component, uint Mask)>();
         var constants = new SortedSet<uint>();
-        var keysProven = TryCollectLaneKeys(instructions, firstLaneIndex, laneKey, uint.MaxValue, leaves, constants,
-            new HashSet<(int, uint, uint)>()) && leaves.Count != 0;
+        var keysProven = false;
+        if (key.Kind == ScalarValueKind.FirstLane)
+        {
+            var firstLaneIndex = FindInstructionIndex(instructions, (uint)key.Payload);
+            if (firstLaneIndex < 0 ||
+                instructions[firstLaneIndex] is not { Opcode: "VReadfirstlaneB32", Sources.Count: 1 } firstLane ||
+                firstLane.Sources[0] is not { Kind: Gen5OperandKind.VectorRegister } laneKey)
+                return RejectHeapLookup(handle, "the key's v_readfirstlane was not found");
 
+            keysProven = TryCollectLaneKeys(instructions, firstLaneIndex, laneKey, uint.MaxValue, leaves, constants,
+                new HashSet<(int, uint, uint)>()) && leaves.Count != 0;
+        }
+
+        // A descriptor word another value also reads keeps its memory read; only the
+        // image handle is replaced by the heap lookup.
         var canSuppressMemoryReads = true;
         for (var dword = 0; dword < reads.Length; dword++)
         {
-            if (!UsesOnly(reads[dword], [handle]))
-                return false;
-            canSuppressMemoryReads &= HasOnlyImageConsumers(_plan.Memory[memoryIndices[dword]], handle);
+            canSuppressMemoryReads &= UsesOnly(reads[dword], [handle]) &&
+                HasOnlyImageConsumers(_plan.Memory[memoryIndices[dword]], handle);
         }
 
         if (!MakeRuntimeBufferSource(heapHandle, pc, out var heapSourceIndex, out var heapSource))
-            return false;
+            return RejectHeapLookup(handle, "the heap descriptor is not a runtime buffer source");
 
         var sources = new SortedSet<LaneKeySource>(Comparer<LaneKeySource>.Create(CompareLaneKeySources));
         foreach (var (load, component, mask) in leaves)
@@ -189,6 +199,19 @@ public sealed partial class ResourceTracker
         };
         return true;
     }
+
+    // Why a descriptor that looked like a heap lookup was not planned as one; the
+    // resource-plan failure for that access names it.
+    private readonly Dictionary<ScalarValue, string> _heapLookupRejections = new(ReferenceEqualityComparer.Instance);
+
+    private bool RejectHeapLookup(ScalarValue handle, string reason)
+    {
+        _heapLookupRejections[handle] = reason;
+        return false;
+    }
+
+    private string DescribeHeapLookupRejection(ScalarValue handle) =>
+        _heapLookupRejections.TryGetValue(handle, out var reason) ? $" (heap lookup: {reason})" : string.Empty;
 
     // Walks the straight-line definitions of a lane key back to the buffer loads and
     // constants it can hold. Anything but a mask, a select, a move or a whole-dword
