@@ -83,6 +83,10 @@ public sealed class LaneKeyedImageTests
         Assert.Equal(0u, source.Component);
         Assert.Equal(KeyMask, source.Mask);
         Assert.Equal(0u, selector.TableOffset);
+
+        var heap = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!.HeapIndexed!;
+        Assert.Equal(new HeapIndexedImageSelector(0, 0, 5), heap);
+        Assert.Equal(32u, heap.RecordBytes);
     }
 
     [Fact]
@@ -158,11 +162,35 @@ public sealed class LaneKeyedImageTests
         Assert.DoesNotContain(snapshot.Images, image => image.SequenceEqual(Descriptor(7)));
     }
 
+    // Key arithmetic the host cannot enumerate still indexes a finite heap: the access is
+    // planned heap-indexed, without a key set, and skipped until a heap array is bound.
     [Fact]
-    public void KeyArithmeticOutsideTheProvenShapesIsStillRejected()
+    public void KeyArithmeticOutsideTheProvenShapesPlansTheWholeHeap()
     {
-        var error = Assert.Throws<ResourcePlanException>(() => Extract(WaterfallProgram(keyOperation: "VAddU32")));
-        Assert.Contains("not a valid runtime value", error.Message);
+        var plan = Extract(WaterfallProgram(keyOperation: "VAddU32"));
+        Assert.Single(plan.Info.Images);
+        var access = Assert.Single(plan.IndirectImages);
+        Assert.True(access.KeyIsAddressOffset);
+
+        var indirect = plan.DescriptorSources[(int)plan.Info.Images[0].Source].IndirectImage!;
+        Assert.Null(indirect.LaneKeys);
+        Assert.Equal(new HeapIndexedImageSelector(0, 0, 5), indirect.HeapIndexed);
+
+        var memory = ResourceTrackerTests.LinearMemory();
+        ResourceTrackerTests.WriteImage(memory, 0x2000, Descriptor(0));
+        var snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        Assert.False(ResourceMaterializer.Materialize(plan, Inputs(KeyBufferUserData(16, 1), readCleanMemory: memory.Read),
+            ref snapshot, ref specialization, out var failure));
+        Assert.Equal(ResourceMaterializationFailure.UnresolvedImageKeys, failure);
+    }
+
+    [Fact]
+    public void UnprovenLoopsOverOneHeapShareTheHeapImage()
+    {
+        var plan = Extract(WaterfallProgram(keyOperation: "VAddU32", loops: 2));
+        Assert.Single(plan.Info.Images);
+        Assert.Equal(2, plan.IndirectImages.Count);
     }
 
     [Fact]

@@ -22,10 +22,12 @@ public sealed partial class ResourceTracker
     //   s_andn2_b32 exec, s107, s63
     //   s_cbranch_execnz loop
     //
-    // The key is lane data, so the scalar graph rightly leaves it undefined. What is
-    // finite is the set of records the key can be loaded from: the host enumerates
-    // every record of those buffers at run time and binds the heap descriptors the
-    // keys select. The shader keeps computing its own key and searches that table.
+    // The key is lane data, so the scalar graph rightly leaves it undefined. The heap
+    // it indexes is finite, though: the access is recorded as heap-indexed, to be bound
+    // as one image array over every heap record. When the key's loads are also known
+    // (a mask, select or move of whole-dword buffer loads), the host can instead
+    // enumerate those records and bind only the descriptors the keys select; the
+    // shader keeps computing its own key and searches that table.
     private bool TryMakeLaneKeyedImage(ScalarValue handle, uint pc, out IndirectImagePlan plan)
     {
         plan = null!;
@@ -111,9 +113,8 @@ public sealed partial class ResourceTracker
 
         var leaves = new List<(Gen5ShaderInstruction Load, uint Component, uint Mask)>();
         var constants = new SortedSet<uint>();
-        if (!TryCollectLaneKeys(instructions, firstLaneIndex, laneKey, uint.MaxValue, leaves, constants,
-                new HashSet<(int, uint, uint)>()) || leaves.Count == 0)
-            return false;
+        var keysProven = TryCollectLaneKeys(instructions, firstLaneIndex, laneKey, uint.MaxValue, leaves, constants,
+            new HashSet<(int, uint, uint)>()) && leaves.Count != 0;
 
         var canSuppressMemoryReads = true;
         for (var dword = 0; dword < reads.Length; dword++)
@@ -129,12 +130,17 @@ public sealed partial class ResourceTracker
         var sources = new SortedSet<LaneKeySource>(Comparer<LaneKeySource>.Create(CompareLaneKeySources));
         foreach (var (load, component, mask) in leaves)
         {
+            if (!keysProven)
+                break;
             if (!_plan.Memory.TryGetIndex(load.Pc, 0, out var loadIndex) || loadIndex >= _plan.Accesses.Length ||
                 _plan.Memory[loadIndex] is not { Kind: MemoryResourceKind.Buffer, Access: MemoryAccess.Read, OffsetEnabled: false } loadMemory ||
                 _plan.Accesses[loadIndex]?.Handle is not { } bufferHandle ||
                 !MakeRuntimeBufferSource(bufferHandle, load.Pc, out var bufferSourceIndex, out _) ||
                 load.Control is not Gen5BufferMemoryControl control)
-                return false;
+            {
+                keysProven = false;
+                break;
+            }
 
             sources.Add(new LaneKeySource(
                 bufferSourceIndex,
@@ -147,14 +153,17 @@ public sealed partial class ResourceTracker
         }
 
         var tableOffset = unchecked(tableImmediate + dynamicBase);
-        var selector = new LaneKeyedImageSelector(tableOffset, dynamicBase)
-        {
-            Sources = [.. sources],
-            Constants = [.. constants],
-        };
+        var selector = keysProven
+            ? new LaneKeyedImageSelector(tableOffset, dynamicBase)
+            {
+                Sources = [.. sources],
+                Constants = [.. constants],
+            }
+            : null;
 
         // Equal heaps and key sources intern to one source, so every waterfall loop that
-        // reads the same key shares one root image and one candidate table.
+        // reads the same key shares one root image and one candidate table. Loops whose
+        // key is not proven share one source per heap and table offset: the whole heap.
         var imageSource = new DescriptorSource
         {
             Dwords = [.. heapSource.Dwords, .. heapSource.Dwords],
@@ -163,6 +172,7 @@ public sealed partial class ResourceTracker
                 TableOffset = tableOffset,
                 DynamicOffsetBase = dynamicBase,
                 LaneKeys = selector,
+                HeapIndexed = new HeapIndexedImageSelector(tableOffset, dynamicBase, LaneKeyedImageShift),
             },
         };
 

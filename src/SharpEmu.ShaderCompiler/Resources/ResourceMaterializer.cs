@@ -216,6 +216,13 @@ public static class ResourceMaterializer
                     }
                     continue;
                 }
+                if (indirect.HeapIndexed is not null)
+                {
+                    // Without a proven key set the access needs the whole heap bound as one
+                    // image array; until the backend binds it, the access is skipped.
+                    failure = ResourceMaterializationFailure.UnresolvedImageKeys;
+                    return false;
+                }
                 if (indirect.Dense)
                 {
                     if (!RuntimeValueEvaluator.EvaluateSources(plan, [indirect.HeapSource], cleanInputs, [], evaluateTable: false,
@@ -831,6 +838,7 @@ public static class ResourceMaterializer
                 continue;
 
             ReportLaneKeyFailure(laneKeys.Sources[index], source.Dwords, reason);
+            ReportLaneKeyHeapCensus(laneKeys, sources[0].Dwords, r128, inputs);
             failure = ResourceMaterializationFailure.UnresolvedImageKeys;
             return false;
         }
@@ -888,6 +896,58 @@ public static class ResourceMaterializer
         }
 
         Console.Error.WriteLine($"[GPU][WARN] {message}");
+    }
+
+    private static readonly HashSet<ulong> _reportedLaneKeyHeaps = [];
+    private const uint LaneKeyHeapCensusEntries = 1u << 16;
+
+    // Once per heap: how many records of the descriptor heap a lane key can select
+    // hold usable image descriptors, and how many of those are distinct. This sizes a
+    // bindless binding of the whole heap.
+    private static void ReportLaneKeyHeapCensus(LaneKeyedImageSelector laneKeys, ReadOnlySpan<uint> heap, bool r128, ResourceRuntimeInputs inputs)
+    {
+        if (heap.Length < 4)
+            return;
+        var heapBase = (heap[0] | ((ulong)(heap[1] & 0xFFFF) << 32)) & AddressMask;
+        lock (_reportedLaneKeyHeaps)
+        {
+            if (_reportedLaneKeyHeaps.Count >= 16 || !_reportedLaneKeyHeaps.Add(heapBase ^ ((ulong)laneKeys.TableOffset << 48)))
+                return;
+        }
+
+        var size = ScalarBufferSize(heap);
+        var entries = size > laneKeys.TableOffset ? (size - laneKeys.TableOffset) >> (int)LaneKeyShift : 0;
+        var scanned = (uint)Math.Min(entries, LaneKeyHeapCensusEntries);
+        uint usable = 0, unreadable = 0, lastUsable = 0;
+        var distinct = new HashSet<string>();
+        var types = new SortedDictionary<uint, uint>();
+        var candidate = new uint[8];
+        for (uint key = 0; key < scanned; key++)
+        {
+            var entry = unchecked(laneKeys.TableOffset + (key << (int)LaneKeyShift));
+            var readable = true;
+            for (uint dword = 0; dword < candidate.Length && readable; dword++)
+                readable = ReadScalarBufferWord(heap, entry, dword * sizeof(uint), inputs, out candidate[dword]);
+            if (!readable)
+            {
+                unreadable++;
+                continue;
+            }
+
+            if (!UsableImageCandidate(candidate, r128))
+                continue;
+            usable++;
+            lastUsable = key;
+            distinct.Add(string.Join(",", candidate));
+            var type = candidate[3] >> 28;
+            types[type] = types.TryGetValue(type, out var count) ? count + 1 : 1;
+        }
+
+        Console.Error.WriteLine(
+            $"[GPU][INFO] lane-keyed heap census: base=0x{heapBase:X} stride={(heap[1] >> 16) & 0x3FFF} records={heap[2]} " +
+            $"size=0x{size:X} table_offset=0x{laneKeys.TableOffset:X} entries={entries} scanned={scanned} usable={usable} " +
+            $"distinct={distinct.Count} highest_usable_key={lastUsable} unreadable={unreadable} " +
+            $"types=[{string.Join(",", types.Select(pair => $"{pair.Key}:{pair.Value}"))}]");
     }
 
     private const uint LaneKeyShift = 5;

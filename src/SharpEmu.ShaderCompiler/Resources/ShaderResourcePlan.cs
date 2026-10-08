@@ -171,6 +171,10 @@ public sealed class ShaderResourcePlan
                 foreach (var keySource in laneKeys.Sources)
                     plan.MarkCleanFlatSlots(plan.DescriptorSources[(int)keySource.BufferSource], cleanSlots);
             }
+            else if (indirect.HeapIndexed is not null)
+            {
+                plan.MarkCleanFlatSlots(plan.DescriptorSources[(int)indirect.HeapSource], cleanSlots);
+            }
             else if (indirect.Dense)
             {
                 plan.MarkCleanFlatSlots(plan.DescriptorSources[(int)indirect.HeapSource], cleanSlots);

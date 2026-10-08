@@ -208,6 +208,7 @@ public sealed record IndirectImageSelector(
     public uint KeyBound { get; init; }
     public WaveIndexedImageSelector? WaveIndexed { get; init; }
     public LaneKeyedImageSelector? LaneKeys { get; init; }
+    public HeapIndexedImageSelector? HeapIndexed { get; init; }
 
     // The key read's immediate offset. The hardware adds it after the 32-bit selector offset, without wrapping.
     public uint MaterialImmediate { get; init; }
@@ -233,6 +234,16 @@ public sealed record LaneKeyedImageSelector(uint TableOffset, uint DynamicOffset
         Sources.SequenceEqual(other.Sources) && Constants.SequenceEqual(other.Constants);
 
     public override int GetHashCode() => HashCode.Combine(TableOffset, DynamicOffsetBase, Sources.Count, Constants.Count);
+}
+
+// A descriptor a waterfall loop selects from a heap by a per-lane key: the shader makes
+// the key uniform with v_readfirstlane and loads record key at
+// TableOffset + (key << RecordShift) of the heap buffer. The key needs no proof on the
+// host: bound as one array over every heap record, the shader indexes it by its own
+// key. LaneKeys, when the key's sources are also known, is the bounded fallback.
+public sealed record HeapIndexedImageSelector(uint TableOffset, uint DynamicOffsetBase, uint RecordShift)
+{
+    public uint RecordBytes => 1u << (int)RecordShift;
 }
 
 public sealed record DirectImageCandidate(uint Offset, uint Source);
