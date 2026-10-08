@@ -713,6 +713,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private const string ImageViewMinLodExtensionName = "VK_EXT_image_view_min_lod";
         private const string FillRectangleExtensionName = "VK_NV_fill_rectangle";
         private bool _supportsImageViewMinLod;
+        private Gpu.Vulkan.VulkanBindlessSupport _bindlessSupport;
 
         private void CreateDevice()
         {
@@ -919,10 +920,15 @@ internal static unsafe partial class VulkanVideoPresenter
                 SType = StructureType.PhysicalDeviceShaderAtomicInt64Features,
                 PNext = &addressFeatures,
             };
+            var descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+            {
+                SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                PNext = &atomicInt64Features,
+            };
             var featuresQuery = new PhysicalDeviceFeatures2
             {
                 SType = StructureType.PhysicalDeviceFeatures2,
-                PNext = &atomicInt64Features,
+                PNext = &descriptorIndexingFeatures,
             };
             _vk.GetPhysicalDeviceFeatures2(_physicalDevice, &featuresQuery);
             var supportsTimelineSemaphore = timelineSemaphoreFeatures.TimelineSemaphore;
@@ -944,6 +950,15 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _vk.GetPhysicalDeviceProperties(_physicalDevice, out var deviceProperties);
             var deviceName = SilkMarshal.PtrToString((nint)deviceProperties.DeviceName) ?? "unknown";
+            _bindlessSupport = Gpu.Vulkan.VulkanBindlessSupport.Decide(
+                descriptorIndexingFeatures.RuntimeDescriptorArray,
+                descriptorIndexingFeatures.DescriptorBindingPartiallyBound,
+                descriptorIndexingFeatures.ShaderSampledImageArrayNonUniformIndexing,
+                descriptorIndexingFeatures.ShaderStorageImageArrayNonUniformIndexing,
+                deviceProperties.Limits.MaxPerStageDescriptorSampledImages,
+                deviceProperties.Limits.MaxPerStageDescriptorStorageImages,
+                Gpu.Vulkan.VulkanBindlessSupport.DisabledByEnvironment());
+            Console.Error.WriteLine($"[LOADER][INFO] Vulkan bindless images: {_bindlessSupport.Describe()}");
             RequireRenderingFeature(vulkan13Features.DynamicRendering, "Vulkan 1.3 dynamicRendering", deviceName);
             RequireRenderingFeature(vulkan13Features.Synchronization2, "Vulkan 1.3 synchronization2", deviceName);
             var supportsColorWriteEnable = colorWriteEnableFeatures.ColorWriteEnable;
@@ -1098,6 +1113,19 @@ internal static unsafe partial class VulkanVideoPresenter
                     };
                     renderingChain = &maintenance5Features;
                 }
+                if (_bindlessSupport.Available)
+                {
+                    descriptorIndexingFeatures = new PhysicalDeviceDescriptorIndexingFeatures
+                    {
+                        SType = StructureType.PhysicalDeviceDescriptorIndexingFeatures,
+                        RuntimeDescriptorArray = true,
+                        DescriptorBindingPartiallyBound = true,
+                        ShaderSampledImageArrayNonUniformIndexing = true,
+                        ShaderStorageImageArrayNonUniformIndexing = _bindlessSupport.StorageImages,
+                        PNext = renderingChain,
+                    };
+                    renderingChain = &descriptorIndexingFeatures;
+                }
                 if (_supportsImageViewMinLod)
                 {
                     imageViewMinLodFeatures = new PhysicalDeviceImageViewMinLodFeaturesEXT
@@ -1185,7 +1213,11 @@ internal static unsafe partial class VulkanVideoPresenter
             }
 
             _vk.GetDeviceQueue(_device, _queueFamilyIndex, 0, out _queue);
-            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device) { ImageViewMinLodSupported = _supportsImageViewMinLod };
+            _deviceInfo = new GpuDeviceInfo(_vk, _physicalDevice, _device)
+            {
+                ImageViewMinLodSupported = _supportsImageViewMinLod,
+                BindlessImages = _bindlessSupport,
+            };
             if (_readbackQueueFamilyIndex is { } readbackQueueFamily)
             {
                 _vk.GetDeviceQueue(_device, readbackQueueFamily, 0, out _readbackQueue);
