@@ -12,7 +12,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace SharpEmu.Libs.Ampr;
 
-public static class AmprExports
+public static partial class AmprExports
 {
     private const int CommandBufferHeaderSize = 0x18;
     private const ulong CommandBufferTypeOffset = 0x00;
@@ -74,7 +74,7 @@ public static class AmprExports
         public ulong GatherScatterFileOffset;
     }
 
-    private sealed class ReadFileCommand
+    internal sealed class ReadFileCommand
     {
         public ulong RecordOffset;
         public ulong RecordSize;
@@ -84,7 +84,7 @@ public static class AmprExports
         public ulong FileOffset;
     }
 
-    private sealed class KernelEventCommand
+    internal sealed class KernelEventCommand
     {
         public ulong RecordOffset;
         public ulong Equeue;
@@ -92,14 +92,14 @@ public static class AmprExports
         public ulong Data;
     }
 
-    private sealed class WriteAddressCommand
+    internal sealed class WriteAddressCommand
     {
         public ulong RecordOffset;
         public ulong Address;
         public ulong Value;
     }
 
-    private sealed class WaitAddressCommand
+    internal sealed class WaitAddressCommand
     {
         public ulong RecordOffset;
         public ulong Address;
@@ -108,7 +108,7 @@ public static class AmprExports
         public uint Flush;
     }
 
-    private sealed class AmmCommand
+    internal sealed class AmmCommand
     {
         public ulong RecordOffset;
         public bool IsUnmap;
@@ -881,7 +881,29 @@ public static class AmprExports
     {
         executionResult = (int)OrbisGen2Result.ORBIS_GEN2_OK;
         errorOffset = 0;
+        var prepared = TryPrepareExecution(ctx, commandBuffer, queueKey: 0, out var execution);
+        if (prepared != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return prepared;
+        }
 
+        var spinWait = new SpinWait();
+        while (!AdvanceExecution(ctx, execution!))
+        {
+            spinWait.SpinOnce();
+        }
+
+        TraceAmpr(ctx, "complete", commandBuffer, execution!.Buffer, execution.WriteOffset);
+        executionResult = execution.ExecutionResult;
+        errorOffset = execution.ErrorOffset;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Snapshots the recorded commands so they can run now or later, after the guest has
+    // already reset and refilled the command buffer object.
+    private static int TryPrepareExecution(CpuContext ctx, ulong commandBuffer, ulong queueKey, out AmprExecution? execution)
+    {
+        execution = null;
         if (commandBuffer == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -933,80 +955,97 @@ public static class AmprExports
         }
         commands.Sort(static (left, right) => left.Offset.CompareTo(right.Offset));
 
-        foreach (var commandEntry in commands)
+        execution = new AmprExecution(
+            new CpuContext(ctx.Memory, ctx.TargetGeneration),
+            commandBuffer,
+            buffer,
+            writeOffset,
+            queueKey,
+            commands,
+            readCommands,
+            kernelEventCommands,
+            writeAddressCommands,
+            waitAddressCommands,
+            ammCommands);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // Runs commands in record order until all are done or a wait-on-address condition does
+    // not hold yet. Returns true once the execution has finished (successfully or not).
+    private static bool AdvanceExecution(CpuContext ctx, AmprExecution execution)
+    {
+        while (execution.Next < execution.Commands.Count)
         {
+            var commandEntry = execution.Commands[execution.Next];
+            var result = (int)OrbisGen2Result.ORBIS_GEN2_OK;
             switch (commandEntry.Kind)
             {
                 case 0:
-                    {
-                        var readCommand = readCommands[commandEntry.Index];
-                        var readResult = CompleteReadFileRecord(ctx, commandBuffer, readCommand);
-                        if (readResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-                        {
-                            executionResult = readResult;
-                            errorOffset = checked((uint)commandEntry.Offset);
-                            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-                        }
-                        break;
-                    }
+                    result = CompleteReadFileRecord(ctx, execution.CommandBuffer, execution.ReadCommands[commandEntry.Index]);
+                    break;
 
                 case 1:
-                    var eventCommand = kernelEventCommands[commandEntry.Index];
+                    var eventCommand = execution.KernelEventCommands[commandEntry.Index];
                     if (!KernelEventQueueCompatExports.TriggerAmprEvent(
                             eventCommand.Equeue,
                             unchecked((uint)eventCommand.Id),
                             eventCommand.Data))
                     {
-                        executionResult = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
-                        errorOffset = checked((uint)commandEntry.Offset);
-                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                        result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
                     }
                     break;
 
                 case 2:
-                    var writeCommand = writeAddressCommands[commandEntry.Index];
+                    var writeCommand = execution.WriteAddressCommands[commandEntry.Index];
                     if (!ctx.TryWriteUInt64(writeCommand.Address, writeCommand.Value))
                     {
-                        executionResult = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-                        errorOffset = checked((uint)commandEntry.Offset);
-                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                        result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
                     }
                     break;
 
                 case 3:
-                    var waitCommand = waitAddressCommands[commandEntry.Index];
-                    var waitResult = WaitForAddress(ctx, waitCommand);
-                    if (waitResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+                    var waitCommand = execution.WaitAddressCommands[commandEntry.Index];
+                    if (waitCommand.Flush != 0)
                     {
-                        executionResult = waitResult;
-                        errorOffset = checked((uint)commandEntry.Offset);
-                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                        Thread.MemoryBarrier();
+                    }
+
+                    if (!ctx.TryReadUInt64(waitCommand.Address, out var value))
+                    {
+                        result = (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+                    }
+                    else if (!IsWaitConditionSatisfied(value, waitCommand.Reference, waitCommand.Compare))
+                    {
+                        return false;
                     }
                     break;
 
                 case 4:
-                    var ammCommand = ammCommands[commandEntry.Index];
-                    var ammResult = ammCommand.IsUnmap
+                    var ammCommand = execution.AmmCommands[commandEntry.Index];
+                    result = ammCommand.IsUnmap
                         ? KernelMemoryCompatExports.AmmUnmap(ctx, ammCommand.Address, ammCommand.Size)
                         : KernelMemoryCompatExports.AmmMap(
                             ctx,
                             ammCommand.Address,
                             ammCommand.Size,
                             ammCommand.Protection,
-                            buffer + ammCommand.RecordOffset + AmmRecordAddressOffset);
-                    TraceAmpr(ctx, ammCommand.IsUnmap ? "amm_unmap_exec" : "amm_map_exec", commandBuffer, ammCommand.Address, ammCommand.Size);
-                    if (ammResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
-                    {
-                        executionResult = ammResult;
-                        errorOffset = checked((uint)commandEntry.Offset);
-                        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-                    }
+                            execution.Buffer + ammCommand.RecordOffset + AmmRecordAddressOffset);
+                    TraceAmpr(ctx, ammCommand.IsUnmap ? "amm_unmap_exec" : "amm_map_exec", execution.CommandBuffer, ammCommand.Address, ammCommand.Size);
                     break;
             }
+
+            if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
+            {
+                execution.ExecutionResult = result;
+                execution.ErrorOffset = checked((uint)commandEntry.Offset);
+                execution.Next = execution.Commands.Count;
+                return true;
+            }
+
+            execution.Next++;
         }
 
-        TraceAmpr(ctx, "complete", commandBuffer, buffer, writeOffset);
-        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        return true;
     }
 
     private static int _unknownReadFileIdWarnings;
@@ -1739,30 +1778,6 @@ public static class AmprExports
         return true;
     }
 
-    private static int WaitForAddress(CpuContext ctx, WaitAddressCommand command)
-    {
-        var spinWait = new SpinWait();
-        while (true)
-        {
-            if (command.Flush != 0)
-            {
-                Thread.MemoryBarrier();
-            }
-
-            if (!ctx.TryReadUInt64(command.Address, out var value))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
-
-            if (IsWaitConditionSatisfied(value, command.Reference, command.Compare))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
-            }
-
-            spinWait.SpinOnce();
-        }
-    }
-
     private static bool IsWaitConditionSatisfied(ulong value, ulong reference, uint compare) => compare switch
     {
         0 => value == reference,
@@ -2090,7 +2105,14 @@ public static class AmprExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
-        var result = CompleteCommandBuffer(ctx, commandBuffer, out var executionResult, out var errorOffset);
+        var result = SubmitCommandBuffer(
+            ctx,
+            commandBuffer,
+            AmmQueueKeyBase + unchecked((ulong)priority),
+            completed: null,
+            out _,
+            out var executionResult,
+            out var errorOffset);
         if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK && executionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
         {
             Console.Error.WriteLine(

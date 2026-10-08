@@ -22,7 +22,15 @@ public static class KernelAprCompatExports
         ulong Priority,
         ulong ResultAddress,
         int ExecutionResult,
-        uint ErrorOffset);
+        uint ErrorOffset,
+        AmprExports.AmprExecution? Pending = null);
+
+    // A submission whose queue waits on an address finishes on the APR worker; its
+    // result is known only then.
+    private static (int ExecutionResult, uint ErrorOffset) ResultOf(AprSubmission submission) =>
+        submission.Pending is { } pending
+            ? (pending.ExecutionResult, pending.ErrorOffset)
+            : (submission.ExecutionResult, submission.ErrorOffset);
 
     [SysAbiExport(
         Nid = "ASoW5WE-UPo",
@@ -47,9 +55,15 @@ public static class KernelAprCompatExports
             submissionId = unchecked((uint)Interlocked.Increment(ref _nextSubmissionId));
         }
 
-        var completionResult = AmprExports.CompleteCommandBuffer(
+        var completionResult = AmprExports.SubmitCommandBuffer(
             ctx,
             commandBuffer,
+            priority,
+            resultAddress == 0
+                ? null
+                : (workerContext, execution) =>
+                    TryWriteAprResult(workerContext, resultAddress, execution.ExecutionResult, execution.ErrorOffset),
+            out var pending,
             out var executionResult,
             out var errorOffset);
         if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
@@ -57,14 +71,14 @@ public static class KernelAprCompatExports
             return completionResult;
         }
         _submittedCommandBuffers[submissionId] =
-            new AprSubmission(commandBuffer, priority, resultAddress, executionResult, errorOffset);
+            new AprSubmission(commandBuffer, priority, resultAddress, executionResult, errorOffset, pending);
 
         if (outSubmissionId != 0 && !ctx.TryWriteUInt32(outSubmissionId, submissionId))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (resultAddress != 0 && !TryWriteAprResult(ctx, resultAddress, executionResult, errorOffset))
+        if (pending is null && resultAddress != 0 && !TryWriteAprResult(ctx, resultAddress, executionResult, errorOffset))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -90,8 +104,10 @@ public static class KernelAprCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
+        submission.Pending?.Wait();
+        var (executionResult, errorOffset) = ResultOf(submission);
         if (submission.ResultAddress != 0 &&
-            !TryWriteAprResult(ctx, submission.ResultAddress, submission.ExecutionResult, submission.ErrorOffset))
+            !TryWriteAprResult(ctx, submission.ResultAddress, executionResult, errorOffset))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -114,9 +130,12 @@ public static class KernelAprCompatExports
         }
 
         var submissionId = unchecked((uint)Interlocked.Increment(ref _nextSubmissionId));
-        var completionResult = AmprExports.CompleteCommandBuffer(
+        var completionResult = AmprExports.SubmitCommandBuffer(
             ctx,
             commandBuffer,
+            ctx[CpuRegister.Rsi],
+            completed: null,
+            out var pending,
             out var executionResult,
             out var errorOffset);
         if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
@@ -124,7 +143,7 @@ public static class KernelAprCompatExports
             return completionResult;
         }
         _submittedCommandBuffers[submissionId] =
-            new AprSubmission(commandBuffer, ctx[CpuRegister.Rsi], 0, executionResult, errorOffset);
+            new AprSubmission(commandBuffer, ctx[CpuRegister.Rsi], 0, executionResult, errorOffset, pending);
 
         TraceApr(ctx, "submit", submissionId, commandBuffer, ctx[CpuRegister.Rsi], 0);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -145,9 +164,12 @@ public static class KernelAprCompatExports
         }
 
         var submissionId = unchecked((uint)Interlocked.Increment(ref _nextSubmissionId));
-        var completionResult = AmprExports.CompleteCommandBuffer(
+        var completionResult = AmprExports.SubmitCommandBuffer(
             ctx,
             commandBuffer,
+            ctx[CpuRegister.Rsi],
+            completed: null,
+            out var pending,
             out var executionResult,
             out var errorOffset);
         if (completionResult != (int)OrbisGen2Result.ORBIS_GEN2_OK)
@@ -155,7 +177,7 @@ public static class KernelAprCompatExports
             return completionResult;
         }
         _submittedCommandBuffers[submissionId] =
-            new AprSubmission(commandBuffer, ctx[CpuRegister.Rsi], 0, executionResult, errorOffset);
+            new AprSubmission(commandBuffer, ctx[CpuRegister.Rsi], 0, executionResult, errorOffset, pending);
 
         if (!ctx.TryWriteUInt32(outSubmissionId, submissionId))
         {
