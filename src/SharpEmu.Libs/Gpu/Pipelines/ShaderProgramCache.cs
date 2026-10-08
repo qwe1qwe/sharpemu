@@ -103,6 +103,10 @@ internal sealed class ShaderProgramCache
     private readonly IGuestGpuBackend _compiler;
     private readonly IShaderPipelineHost _host;
     private readonly Dictionary<ProgramKey, ProgramSourceEntry> _programs = new();
+
+    // A program whose resource plan cannot be built is rejected on every dispatch; the
+    // plan depends only on the key, so the analysis runs once and the verdict is reused.
+    private readonly Dictionary<ProgramKey, string> _rejectedPrograms = new();
     private readonly Dictionary<(ulong Hash, uint CodeSize), Gen5ShaderProgram> _decoded = new();
     private readonly Dictionary<(ulong Hash, uint CodeSize), ShaderCodeCapture> _codeCaptures = new();
     private readonly List<uint> _staticState = new(StageStaticKey.MaxWords);
@@ -245,7 +249,21 @@ internal sealed class ShaderProgramCache
         };
         if (entry is null)
         {
-            entry = CreateEntry(source, options);
+            if (_rejectedPrograms.TryGetValue(key, out var rejection))
+            {
+                throw new ShaderProgramRejectedException(rejection);
+            }
+
+            try
+            {
+                entry = CreateEntry(source, options);
+            }
+            catch (ShaderProgramRejectedException exception)
+            {
+                _rejectedPrograms[key] = exception.Message;
+                throw;
+            }
+
             _programs.Add(key, entry);
             ShaderCacheCounters.CountProgram();
         }
